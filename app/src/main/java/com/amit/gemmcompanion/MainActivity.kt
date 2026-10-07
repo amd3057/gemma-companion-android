@@ -3,11 +3,14 @@ package com.amit.gemmcompanion
 import android.Manifest
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -37,14 +40,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
+import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.EditNote
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.VolumeOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -62,7 +68,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -82,6 +87,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -90,23 +96,38 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class MediaDisclosure { CAMERA, MICROPHONE }
+
+private const val PRIVACY_POLICY_URL =
+    "https://github.com/amd3057/gemma-companion-android/blob/main/PRIVACY_POLICY.md"
+
 @SuppressLint("MissingPermission")
 @Composable
 private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     var draft by rememberSaveable { mutableStateOf("") }
     var isRecording by remember { mutableStateOf(false) }
     var ttsReady by remember { mutableStateOf(false) }
+    var activeUtteranceId by remember { mutableStateOf<String?>(null) }
     var showOrganizer by remember { mutableStateOf(false) }
     var showModelCatalog by remember { mutableStateOf(false) }
+    var showPrivacyPolicy by remember { mutableStateOf(false) }
+    var mediaDisclosure by remember { mutableStateOf<MediaDisclosure?>(null) }
     var pendingReminder by remember { mutableStateOf<Pair<String, Long>?>(null) }
-    val recorder = remember { AudioRecorder() }
+    val speechTranscriber = remember { SpeechTranscriber(context) }
     val textToSpeech = remember {
-        TextToSpeech(context) { status ->
-            ttsReady = status == TextToSpeech.SUCCESS
+        lateinit var tts: TextToSpeech
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                val res = tts.setLanguage(Locale.getDefault())
+                if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    tts.setLanguage(Locale.US)
+                }
+                ttsReady = true
+            }
         }
+        tts
     }
 
     val modelPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -118,23 +139,28 @@ private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
     val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
             isRecording = true
-            recorder.start(
-                scope = scope,
-                onFinished = { audio ->
-                    scope.launch {
-                        isRecording = false
-                        viewModel.setAudio(audio)
+            draft = ""
+            viewModel.reportStatus("Listening and transcribing on this device…")
+            speechTranscriber.startListening(
+                onPartialResult = { partial -> draft = partial },
+                onFinalResult = { final ->
+                    isRecording = false
+                    speechTranscriber.stop()
+                    if (final.isNotBlank()) {
+                        draft = ""
+                        viewModel.send(final)
+                    } else {
+                        viewModel.reportStatus("No speech was recognized. Try again or type your message.")
                     }
                 },
                 onError = { message ->
-                    scope.launch {
-                        isRecording = false
-                        viewModel.reportStatus(message)
-                    }
+                    viewModel.reportStatus(message)
+                    isRecording = false
+                    speechTranscriber.stop()
                 }
             )
         } else {
-            viewModel.reportStatus("Microphone permission is needed to send voice clips.")
+            viewModel.reportStatus("Microphone permission is needed for on-device transcription.")
         }
     }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -148,8 +174,32 @@ private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
     }
 
     DisposableEffect(Unit) {
+        textToSpeech.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                if (utteranceId != null) context.mainExecutor.execute { activeUtteranceId = utteranceId }
+            }
+
+            override fun onDone(utteranceId: String?) {
+                context.mainExecutor.execute {
+                    if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                }
+            }
+
+            override fun onError(utteranceId: String?) {
+                context.mainExecutor.execute {
+                    if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                }
+            }
+
+            @Suppress("OVERRIDE_DEPRECATION")
+            override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                context.mainExecutor.execute {
+                    if (activeUtteranceId == utteranceId) activeUtteranceId = null
+                }
+            }
+        })
         onDispose {
-            recorder.cancel()
+            speechTranscriber.stop()
             textToSpeech.stop()
             textToSpeech.shutdown()
         }
@@ -157,6 +207,17 @@ private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
 
     LaunchedEffect(viewModel.turns.size) {
         if (viewModel.turns.isNotEmpty()) listState.animateScrollToItem(viewModel.turns.lastIndex)
+    }
+
+    fun speakText(text: String) {
+        if (!ttsReady || text.isBlank()) return
+        textToSpeech.setLanguage(Locale.getDefault())
+        val utteranceId = UUID.randomUUID().toString()
+        activeUtteranceId = utteranceId
+        if (textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId) == TextToSpeech.ERROR) {
+            activeUtteranceId = null
+            viewModel.reportStatus("Text-to-speech could not start.")
+        }
     }
 
     MaterialTheme(
@@ -181,14 +242,17 @@ private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
                 Header(
                     modelLabel = viewModel.modelLabel.value,
                     memoryCount = viewModel.turns.count { it.role == "user" },
+                    isSpeaking = activeUtteranceId != null,
                     onManageModels = { showModelCatalog = true },
                     onOpenOrganizer = { showOrganizer = true },
                     onClearMemory = viewModel::clearMemory,
                     onSpeakLatest = {
-                        val lastAnswer = viewModel.turns.lastOrNull { it.role == "assistant" }?.text
-                        if (ttsReady && !lastAnswer.isNullOrBlank()) {
-                            textToSpeech.setLanguage(Locale.getDefault())
-                            textToSpeech.speak(lastAnswer, TextToSpeech.QUEUE_FLUSH, null, "gemma-answer")
+                        if (activeUtteranceId != null || textToSpeech.isSpeaking) {
+                            textToSpeech.stop()
+                            activeUtteranceId = null
+                        } else {
+                            val lastAnswer = viewModel.turns.lastOrNull { it.role == "assistant" }?.text
+                            if (ttsReady && !lastAnswer.isNullOrBlank()) speakText(lastAnswer)
                         }
                     }
                 )
@@ -248,11 +312,14 @@ private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
                             turn = turn,
                             onSaveNote = viewModel::addNote,
                             onSpeak = { text ->
-                                if (ttsReady) {
-                                    textToSpeech.setLanguage(Locale.getDefault())
-                                    textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "gemma-message")
+                                if (activeUtteranceId != null || textToSpeech.isSpeaking) {
+                                    textToSpeech.stop()
+                                    activeUtteranceId = null
+                                } else if (ttsReady) {
+                                    speakText(text)
                                 }
-                            }
+                            },
+                            isSpeaking = activeUtteranceId != null
                         )
                     }
                     if (viewModel.isSending.value) {
@@ -264,34 +331,62 @@ private fun CompanionApp(viewModel: CompanionViewModel = viewModel()) {
                     draft = draft,
                     onDraftChange = { draft = it },
                     image = viewModel.attachedImage.value,
-                    audioAttached = viewModel.attachedAudio.value != null,
                     recording = isRecording,
                     enabled = viewModel.modelReady.value && !viewModel.isSending.value,
-                    onCamera = { camera.launch(null) },
+                    imageSupported = viewModel.modelSupportsImage.value,
+                    onImageUnsupported = {
+                        viewModel.reportStatus("This model is text-only. Tap Model and select an image-capable Gemma model.")
+                    },
+                    onCamera = { mediaDisclosure = MediaDisclosure.CAMERA },
                     onMicrophone = {
                         if (isRecording) {
                             isRecording = false
-                            recorder.stop()
+                            speechTranscriber.finishListening()
                         } else {
-                            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                            mediaDisclosure = MediaDisclosure.MICROPHONE
                         }
                     },
+                    onPrivacy = { showPrivacyPolicy = true },
                     onRemoveImage = { viewModel.setImage(null) },
-                    onRemoveAudio = { viewModel.setAudio(null) },
                     onSend = {
                         viewModel.send(draft)
                         draft = ""
                     }
                 )
+
+                if (showPrivacyPolicy) {
+                    PrivacyPolicyDialog(
+                        onDismiss = { showPrivacyPolicy = false },
+                        onOpenPolicy = {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))
+                        }
+                    )
+                }
+
+                mediaDisclosure?.let { disclosure ->
+                    MediaDisclosureDialog(
+                        disclosure = disclosure,
+                        onDismiss = { mediaDisclosure = null },
+                        onContinue = {
+                            mediaDisclosure = null
+                            when (disclosure) {
+                                MediaDisclosure.CAMERA -> camera.launch(null)
+                                MediaDisclosure.MICROPHONE -> microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        }
+                    )
+                }
             }
         }
     }
+
 }
 
 @Composable
 private fun Header(
     modelLabel: String?,
     memoryCount: Int,
+    isSpeaking: Boolean,
     onManageModels: () -> Unit,
     onOpenOrganizer: () -> Unit,
     onClearMemory: () -> Unit,
@@ -306,16 +401,20 @@ private fun Header(
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text("Mira", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text(modelLabel ?: "Choose an on-device model", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                Text(modelLabel ?: "Private Agent · on-device", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
             }
-            IconButton(onClick = onManageModels) {
+            TextButton(onClick = onManageModels) {
                 Icon(Icons.Rounded.FolderOpen, contentDescription = "Select or download a model")
+                Text("Model")
             }
             IconButton(onClick = onOpenOrganizer) {
                 Icon(Icons.Rounded.EditNote, contentDescription = "Open notes and reminders")
             }
             IconButton(onClick = onSpeakLatest) {
-                Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = "Speak latest answer")
+                Icon(
+                    if (isSpeaking) Icons.AutoMirrored.Rounded.VolumeOff else Icons.AutoMirrored.Rounded.VolumeUp,
+                    contentDescription = if (isSpeaking) "Stop spoken answer" else "Speak latest answer"
+                )
             }
             IconButton(onClick = onClearMemory, enabled = memoryCount > 0) {
                 Icon(Icons.Rounded.DeleteOutline, contentDescription = "Clear conversation memory")
@@ -692,7 +791,12 @@ private fun WelcomePanel(onPrompt: (String) -> Unit) {
 }
 
 @Composable
-private fun MessageBubble(turn: ChatTurn, onSpeak: (String) -> Unit, onSaveNote: (String) -> Unit) {
+private fun MessageBubble(
+    turn: ChatTurn,
+    onSpeak: (String) -> Unit,
+    onSaveNote: (String) -> Unit,
+    isSpeaking: Boolean
+) {
     val isAssistant = turn.role == "assistant"
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -717,7 +821,11 @@ private fun MessageBubble(turn: ChatTurn, onSpeak: (String) -> Unit, onSaveNote:
                             Icon(Icons.Rounded.EditNote, contentDescription = "Save answer as note", modifier = Modifier.size(18.dp))
                         }
                         IconButton(onClick = { onSpeak(turn.text) }, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.AutoMirrored.Rounded.VolumeUp, contentDescription = "Speak this answer", modifier = Modifier.size(18.dp))
+                            Icon(
+                                if (isSpeaking) Icons.AutoMirrored.Rounded.VolumeOff else Icons.AutoMirrored.Rounded.VolumeUp,
+                                contentDescription = if (isSpeaking) "Stop spoken answer" else "Speak this answer",
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                     }
                 }
@@ -731,36 +839,31 @@ private fun Composer(
     draft: String,
     onDraftChange: (String) -> Unit,
     image: Bitmap?,
-    audioAttached: Boolean,
     recording: Boolean,
     enabled: Boolean,
+    imageSupported: Boolean,
+    onImageUnsupported: () -> Unit,
     onCamera: () -> Unit,
     onMicrophone: () -> Unit,
+    onPrivacy: () -> Unit,
     onRemoveImage: () -> Unit,
-    onRemoveAudio: () -> Unit,
     onSend: () -> Unit
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, shadowElevation = 8.dp) {
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
-            if (image != null || audioAttached) {
+            if (image != null) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 8.dp)) {
-                    if (image != null) {
-                        androidx.compose.foundation.Image(
-                            bitmap = image.asImageBitmap(),
-                            contentDescription = "Camera attachment",
-                            modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp))
-                        )
-                        Text("Photo attached", modifier = Modifier.padding(start = 8.dp).weight(1f))
-                        IconButton(onClick = onRemoveImage) { Text("×") }
-                    }
-                    if (audioAttached) {
-                        Text("Voice clip attached", modifier = Modifier.weight(1f))
-                        IconButton(onClick = onRemoveAudio) { Text("×") }
-                    }
+                    androidx.compose.foundation.Image(
+                        bitmap = image.asImageBitmap(),
+                        contentDescription = "Camera attachment",
+                        modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp))
+                    )
+                    Text("Photo attached", modifier = Modifier.padding(start = 8.dp).weight(1f))
+                    IconButton(onClick = onRemoveImage) { Text("×") }
                 }
             }
             Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                IconButton(onClick = onCamera, enabled = enabled) {
+                IconButton(onClick = { if (imageSupported) onCamera() else onImageUnsupported() }, enabled = enabled) {
                     Icon(Icons.Rounded.CameraAlt, contentDescription = "Take a camera photo")
                 }
                 IconButton(onClick = onMicrophone, enabled = enabled) {
@@ -777,12 +880,63 @@ private fun Composer(
                 )
                 IconButton(
                     onClick = onSend,
-                    enabled = enabled && (draft.isNotBlank() || image != null || audioAttached)
+                    enabled = enabled && (draft.isNotBlank() || image != null)
                 ) {
                     Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send message", tint = MaterialTheme.colorScheme.primary)
                 }
             }
-            Text("Local model · conversation memory stays on this device", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Local inference · your content stays on device",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f).padding(start = 8.dp, top = 4.dp)
+                )
+                TextButton(onClick = onPrivacy) { Text("Privacy") }
+            }
         }
     }
+}
+
+@Composable
+private fun MediaDisclosureDialog(
+    disclosure: MediaDisclosure,
+    onDismiss: () -> Unit,
+    onContinue: () -> Unit
+) {
+    val isCamera = disclosure == MediaDisclosure.CAMERA
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (isCamera) "Use a camera image" else "Use voice input") },
+        text = {
+            Text(
+                if (isCamera) {
+                    "The photo you take is processed by your selected on-device Gemma model. If EmbeddingGemma 2 is enabled, it also creates a local image vector to find related saved notes. This app does not upload the photo."
+                } else {
+                    "Android's on-device speech recognizer processes your voice and returns a transcript. Only the transcript is sent to your on-device Gemma model; this app does not save or upload a voice recording."
+                }
+            )
+        },
+        confirmButton = {
+            Button(onClick = onContinue) { Text(if (isCamera) "Continue to camera" else "Continue to microphone") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
+private fun PrivacyPolicyDialog(onDismiss: () -> Unit, onOpenPolicy: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Privacy") },
+        text = {
+            Text(
+                "Chat, notes, photos, transcripts, reminders, and model files are stored or processed on this device. " +
+                    "Internet access is used to load the model catalog and download models. The configured Android text-to-speech provider may process text it reads. " +
+                    "You can clear chat history from the header and delete notes or reminders in the notebook."
+            )
+        },
+        confirmButton = { TextButton(onClick = onOpenPolicy) { Text("Full privacy policy") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+    )
 }

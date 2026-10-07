@@ -24,26 +24,20 @@ class LiteRtGemmaRuntime(private val context: Context) {
     private var currentHistory: List<ChatTurn> = emptyList()
     private var activeBackendIndex: Int = 0
 
-    var isMultimodalModel: Boolean = false
+    var supportsImage: Boolean = false
         private set
 
-    suspend fun load(modelFile: File, history: List<ChatTurn>) = withContext(Dispatchers.IO) {
+    suspend fun load(modelFile: File, history: List<ChatTurn>, supportsImage: Boolean) = withContext(Dispatchers.IO) {
         close()
         currentModelFile = modelFile
         currentHistory = history
-
-        val fileName = modelFile.name.lowercase()
-        isMultimodalModel = fileName.contains("3n") ||
-            fileName.contains("multimodal") ||
-            fileName.contains("paligemma") ||
-            fileName.contains("audio") ||
-            fileName.contains("vision")
+        this@LiteRtGemmaRuntime.supportsImage = supportsImage
 
         val backends = getAvailableBackends()
         var lastError: Exception? = null
         for (index in backends.indices) {
             try {
-                initEngineAndConversation(modelFile, history, backends[index])
+                initEngineAndConversation(modelFile, history, supportsImage, backends[index])
                 activeBackendIndex = index
                 return@withContext
             } catch (e: Exception) {
@@ -66,13 +60,16 @@ class LiteRtGemmaRuntime(private val context: Context) {
         }
     }
 
-    private fun initEngineAndConversation(modelFile: File, history: List<ChatTurn>, backend: Backend) {
-        val isCpu = backend is Backend.CPU
+    private fun initEngineAndConversation(
+        modelFile: File,
+        history: List<ChatTurn>,
+        supportsImage: Boolean,
+        backend: Backend
+    ) {
         val config = EngineConfig(
             modelPath = modelFile.absolutePath,
             backend = backend,
-            visionBackend = if (isMultimodalModel && !isCpu) Backend.GPU() else null,
-            audioBackend = if (isMultimodalModel && !isCpu) Backend.CPU() else null,
+            visionBackend = if (supportsImage) Backend.GPU() else null,
             cacheDir = context.cacheDir.absolutePath
         )
 
@@ -89,7 +86,7 @@ class LiteRtGemmaRuntime(private val context: Context) {
         val nextConversation = runCatching {
             nextEngine.createConversation(
                 ConversationConfig(
-                    systemInstruction = if (isMultimodalModel) {
+                    systemInstruction = if (supportsImage) {
                         Contents.of("You are a warm, helpful, grounded AI companion.")
                     } else null,
                     initialMessages = initialMessages,
@@ -108,15 +105,21 @@ class LiteRtGemmaRuntime(private val context: Context) {
         conversation = nextConversation
     }
 
-    suspend fun reply(text: String, image: Bitmap?, audioWav: ByteArray?): String = withContext(Dispatchers.IO) {
+    suspend fun reply(text: String, image: Bitmap?): String = withContext(Dispatchers.IO) {
         val activeConversation = checkNotNull(conversation) { "Import or load a compatible Gemma .litertlm model first." }
 
         val content = buildList {
-            if (image != null && isMultimodalModel) add(Content.ImageBytes(image.toPngBytes()))
-            if (audioWav != null && isMultimodalModel) add(Content.AudioBytes(audioWav))
-            if (text.isNotBlank()) add(Content.Text(text))
+            if (image != null && supportsImage) {
+                add(Content.ImageBytes(image.toPngBytes()))
+            }
+            check(image == null || supportsImage) {
+                "The selected chat model does not support image input. Choose an image-capable Gallery model."
+            }
+            if (text.isNotBlank()) {
+                add(Content.Text(text))
+            }
         }
-        check(content.isNotEmpty()) { "Please enter a message or attach an image/audio clip." }
+        check(content.isNotEmpty()) { "Please enter a message or attach an image." }
 
         try {
             executeReply(activeConversation, content)
@@ -127,7 +130,7 @@ class LiteRtGemmaRuntime(private val context: Context) {
                     close()
                     for (index in (activeBackendIndex + 1)..backends.lastIndex) {
                         try {
-                            initEngineAndConversation(modelFile, currentHistory, backends[index])
+                            initEngineAndConversation(modelFile, currentHistory, supportsImage, backends[index])
                             activeBackendIndex = index
                             val fallbackConversation = checkNotNull(conversation)
                             return@withContext executeReply(fallbackConversation, content)

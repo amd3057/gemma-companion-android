@@ -1,11 +1,13 @@
 package com.amit.gemmcompanion
 
 import android.content.Context
+import android.graphics.Bitmap
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.retrieval.universalembedder.UniversalEmbedder
 import com.google.mediapipe.tasks.retrieval.universalembedder.UniversalEmbedderOptions
 import java.io.File
+import java.io.ByteArrayOutputStream
 import kotlin.math.sqrt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -45,19 +47,31 @@ class EmbeddingGemmaMemory(context: Context) {
         writeRecords(records)
     }
 
-    suspend fun relevantNotes(query: String, notes: List<CompanionNote>, limit: Int = 5): List<String> =
+    suspend fun relevantNotes(
+        query: String,
+        image: Bitmap?,
+        notes: List<CompanionNote>,
+        limit: Int = 5
+    ): List<String> =
         withContext(Dispatchers.IO) {
             val activeEmbedder = embedder
-            if (activeEmbedder == null || query.isBlank()) {
+            if (activeEmbedder == null || (query.isBlank() && image == null)) {
                 return@withContext notes.takeLast(limit).map { it.text }
             }
 
-            val queryVector = runCatching { embeddingFor(activeEmbedder, query) }.getOrNull()
-                ?: return@withContext notes.takeLast(limit).map { it.text }
+            val textVector = query.takeIf { it.isNotBlank() }
+                ?.let { runCatching { embeddingFor(activeEmbedder, it) }.getOrNull() }
+            val imageVector = image?.let { runCatching { embeddingForImage(activeEmbedder, it) }.getOrNull() }
+            if (textVector == null && imageVector == null) {
+                return@withContext notes.takeLast(limit).map { it.text }
+            }
+
             val noteById = notes.associateBy { it.id }
             readRecords().mapNotNull { (id, vector) ->
                 val note = noteById[id] ?: return@mapNotNull null
-                note.text to cosineSimilarity(queryVector, vector)
+                val textScore = textVector?.let { cosineSimilarity(it, vector) } ?: Float.NEGATIVE_INFINITY
+                val imageScore = imageVector?.let { cosineSimilarity(it, vector) } ?: Float.NEGATIVE_INFINITY
+                note.text to maxOf(textScore, imageScore)
             }.sortedByDescending { it.second }.take(limit).map { it.first }
         }
 
@@ -78,6 +92,17 @@ class EmbeddingGemmaMemory(context: Context) {
         val result = activeEmbedder.embedText(text)
         return checkNotNull(result.embeddings().firstOrNull()?.floatEmbedding()) {
             "EmbeddingGemma2 did not return a text vector."
+        }
+    }
+
+    private fun embeddingForImage(activeEmbedder: UniversalEmbedder, bitmap: Bitmap): FloatArray {
+        val imageBytes = ByteArrayOutputStream().use { output ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)
+            output.toByteArray()
+        }
+        val result = activeEmbedder.embedContent(listOf(imageBytes))
+        return checkNotNull(result.embeddings().firstOrNull()?.floatEmbedding()) {
+            "EmbeddingGemma2 did not return an image vector."
         }
     }
 

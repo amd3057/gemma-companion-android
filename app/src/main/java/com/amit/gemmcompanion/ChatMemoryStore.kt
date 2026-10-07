@@ -30,8 +30,13 @@ class ChatMemoryStore(context: Context) {
 
     fun modelPath(): String? = preferences.getString(KEY_MODEL_PATH, null)
 
-    fun setModelPath(path: String) {
-        preferences.edit().putString(KEY_MODEL_PATH, path).apply()
+    fun modelSupportsImage(): Boolean = preferences.getBoolean(KEY_MODEL_SUPPORTS_IMAGE, false)
+
+    fun setModelPath(path: String, supportsImage: Boolean) {
+        preferences.edit()
+            .putString(KEY_MODEL_PATH, path)
+            .putBoolean(KEY_MODEL_SUPPORTS_IMAGE, supportsImage)
+            .apply()
     }
 
     fun clear() {
@@ -41,6 +46,7 @@ class ChatMemoryStore(context: Context) {
     private companion object {
         const val KEY_TURNS = "turns"
         const val KEY_MODEL_PATH = "model_path"
+        const val KEY_MODEL_SUPPORTS_IMAGE = "model_supports_image"
         const val MAX_TURNS = 40
     }
 }

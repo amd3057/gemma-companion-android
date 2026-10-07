@@ -10,6 +10,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 data class ModelDownloadProgress(val fileName: String, val receivedBytes: Long, val totalBytes: Long)
@@ -19,6 +21,7 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
     private val organizer = OrganizerStore(application)
     private val embeddingMemory = EmbeddingGemmaMemory(application)
     private val runtime = LiteRtGemmaRuntime(application)
+    private val modelLoadMutex = Mutex()
     private var modelDownloadJob: Job? = null
 
     val turns = androidx.compose.runtime.mutableStateListOf<ChatTurn>().apply { addAll(memory.load()) }
@@ -31,11 +34,11 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         private set
     var modelReady = androidx.compose.runtime.mutableStateOf(false)
         private set
+    var modelSupportsImage = androidx.compose.runtime.mutableStateOf(false)
+        private set
     var status = androidx.compose.runtime.mutableStateOf("Import a Gemma 3n .litertlm model to begin.")
         private set
     var attachedImage = androidx.compose.runtime.mutableStateOf<Bitmap?>(null)
-        private set
-    var attachedAudio = androidx.compose.runtime.mutableStateOf<ByteArray?>(null)
         private set
     var modelLabel = androidx.compose.runtime.mutableStateOf<String?>(null)
         private set
@@ -58,7 +61,7 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         }
         memory.modelPath()?.let { path ->
             val modelFile = File(path)
-            if (modelFile.exists()) loadModel(modelFile)
+            if (modelFile.exists()) loadModel(modelFile, memory.modelSupportsImage())
         }
     }
 
@@ -71,6 +74,16 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                 val models = ModelCatalogRepository.loadMultimodalModels()
                 catalog.clear()
                 catalog.addAll(models)
+                val selectedFile = memory.modelPath()?.let(::File)
+                val selectedModel = selectedFile?.takeIf { it.exists() }?.let { file ->
+                    models.firstOrNull { it.purpose == GalleryModelPurpose.CHAT && it.modelFile == file.name }
+                }
+                if (selectedFile != null && selectedModel != null &&
+                    memory.modelSupportsImage() != selectedModel.supportsImage
+                ) {
+                    memory.setModelPath(selectedFile.absolutePath, selectedModel.supportsImage)
+                    loadModel(selectedFile, selectedModel.supportsImage)
+                }
             } catch (error: Exception) {
                 catalogError.value = error.message ?: "Could not load the Gallery model catalog."
             } finally {
@@ -101,8 +114,8 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
             activateEmbeddingModel(file)
             return
         }
-        memory.setModelPath(file.absolutePath)
-        loadModel(file)
+        memory.setModelPath(file.absolutePath, model.supportsImage)
+        loadModel(file, model.supportsImage)
     }
 
     fun downloadAndSelectModel(model: GalleryModel) {
@@ -125,9 +138,9 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                         downloadProgress.value = ModelDownloadProgress(model.modelFile, received, total)
                     }
                 }
-                memory.setModelPath(modelFile.absolutePath)
+                memory.setModelPath(modelFile.absolutePath, model.supportsImage)
                 downloadProgress.value = null
-                initializeModel(modelFile)
+                initializeModel(modelFile, model.supportsImage)
             } catch (_: CancellationException) {
                 status.value = "Model download cancelled."
             } catch (error: Exception) {
@@ -211,8 +224,9 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                     destination
                 }
-                memory.setModelPath(modelFile.absolutePath)
-                loadModel(modelFile)
+                val supportsImage = inferImageSupport(modelFile)
+                memory.setModelPath(modelFile.absolutePath, supportsImage)
+                loadModel(modelFile, supportsImage)
             } catch (error: Exception) {
                 status.value = error.message ?: "Could not import the model."
                 isLoadingModel.value = false
@@ -220,20 +234,26 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun loadModel(modelFile: File) {
+    private fun loadModel(modelFile: File, supportsImage: Boolean = memory.modelSupportsImage()) {
         viewModelScope.launch {
-            isLoadingModel.value = true
-            initializeModel(modelFile)
-            isLoadingModel.value = false
+            modelLoadMutex.withLock {
+                isLoadingModel.value = true
+                try {
+                    initializeModel(modelFile, supportsImage)
+                } finally {
+                    isLoadingModel.value = false
+                }
+            }
         }
     }
 
-    private suspend fun initializeModel(modelFile: File) {
+    private suspend fun initializeModel(modelFile: File, supportsImage: Boolean) {
         modelReady.value = false
         modelLabel.value = modelFile.name
+        modelSupportsImage.value = supportsImage
         status.value = "Loading Gemma on-device. First load can take a while."
         try {
-            runtime.load(modelFile, turns.toList())
+            runtime.load(modelFile, turns.toList(), supportsImage)
             modelReady.value = true
             status.value = "Ready · your conversation memory stays on this device."
         } catch (error: Exception) {
@@ -241,12 +261,14 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun setImage(bitmap: Bitmap?) {
-        attachedImage.value = bitmap
+    private fun inferImageSupport(modelFile: File): Boolean {
+        val fileName = modelFile.name.lowercase()
+        return fileName.contains("3n") || fileName.contains("vision") ||
+            fileName.contains("multimodal") || fileName.contains("paligemma")
     }
 
-    fun setAudio(wav: ByteArray?) {
-        attachedAudio.value = wav
+    fun setImage(bitmap: Bitmap?) {
+        attachedImage.value = bitmap
     }
 
     fun reportStatus(message: String) {
@@ -282,21 +304,20 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
     fun send(text: String) {
         if (!modelReady.value || isSending.value) return
         val image = attachedImage.value
-        val audio = attachedAudio.value
-        if (text.isBlank() && image == null && audio == null) return
+        val effectiveText = text.ifBlank {
+            if (image != null) "[Camera image attached]" else ""
+        }
+        if (effectiveText.isBlank() && image == null) return
 
-        val capturedNote = extractNoteCapture(text)
+        val capturedNote = extractNoteCapture(effectiveText)
         if (capturedNote != null) addNote(capturedNote)
 
         val userText = buildList {
-            if (text.isNotBlank()) add(text.trim())
-            if (image != null) add("[Camera image attached]")
-            if (audio != null) add("[Voice recording attached]")
+            if (effectiveText.isNotBlank()) add(effectiveText)
         }.joinToString("\n")
         turns.add(ChatTurn("user", userText))
         memory.save(turns)
         attachedImage.value = null
-        attachedAudio.value = null
         isSending.value = true
         status.value = if (capturedNote == null) {
             "Gemma is thinking on-device…"
@@ -305,8 +326,10 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         }
         viewModelScope.launch {
             try {
-                val savedNotes = if (embeddingModelReady.value && text.isNotBlank()) {
-                    embeddingMemory.relevantNotes(text, notes.toList()) + notes.takeLast(3).map { it.text }
+                val savedNotes = if (embeddingModelReady.value && effectiveText.isNotBlank()) {
+                    embeddingMemory.relevantNotes(effectiveText, image, notes.toList()) + notes.takeLast(3).map { it.text }
+                } else if (embeddingModelReady.value && image != null) {
+                    embeddingMemory.relevantNotes("", image, notes.toList()) + notes.takeLast(3).map { it.text }
                 } else {
                     notes.takeLast(12).map { it.text }
                 }
@@ -317,12 +340,12 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                         append(noteContext)
                         append("\n\n")
                     }
-                    if (text.isNotBlank()) {
+                    if (effectiveText.isNotBlank()) {
                         append("Current message:\n")
-                        append(text.trim())
+                        append(effectiveText)
                     }
                 }
-                val response = runtime.reply(modelPrompt, image, audio)
+                val response = runtime.reply(modelPrompt, image)
                 turns.add(ChatTurn("assistant", response.ifBlank { "I couldn't generate a response." }))
                 memory.save(turns)
                 status.value = "Ready · memory updated on this device."

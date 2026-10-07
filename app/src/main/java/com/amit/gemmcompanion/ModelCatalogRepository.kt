@@ -21,7 +21,8 @@ data class GalleryModel(
     val description: String,
     val sizeInBytes: Long,
     val minDeviceMemoryInGb: Int,
-    val downloadUrl: String
+    val downloadUrl: String,
+    val supportsImage: Boolean = false
 ) {
     val modelPageUrl: String
         get() = "https://huggingface.co/$modelId"
@@ -72,7 +73,8 @@ object ModelCatalogRepository {
                             description = item.optString("description"),
                             sizeInBytes = item.optLong("sizeInBytes"),
                             minDeviceMemoryInGb = item.optInt("minDeviceMemoryInGb", 0),
-                            downloadUrl = downloadUrl
+                            downloadUrl = downloadUrl,
+                            supportsImage = item.optBoolean("llmSupportImage")
                         )
                     )
                 }
