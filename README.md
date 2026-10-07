@@ -46,3 +46,10 @@ Conversation turns, notes, and EmbeddingGemma2 vectors are stored locally on the
 
 - [Google AI Edge Gallery](https://github.com/google-ai-edge/gallery)
 - [LiteRT-LM Kotlin API](https://github.com/google-ai-edge/LiteRT-LM/blob/main/docs/api/kotlin/getting_started.md)
+
+## Screenshots
+
+<p align="center">
+	<img src="store-listing/screenshots/phone-home-play.png" width="320" alt="Mira - Private Agent home screen" />
+	<img src="store-listing/screenshots/phone-model-catalog-play.png" width="320" alt="Mira model catalog with Gemma and EmbeddingGemma options" />
+</p>
