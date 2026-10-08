@@ -52,4 +52,5 @@ Conversation turns, notes, and EmbeddingGemma2 vectors are stored locally on the
 <p align="center">
 	<img src="store-listing/screenshots/phone-home-play.png" width="320" alt="Mira - Private Agent home screen" />
 	<img src="store-listing/screenshots/phone-model-catalog-play.png" width="320" alt="Mira model catalog with Gemma and EmbeddingGemma options" />
+	<img src="store-listing/screenshots/phone-chat-agent-experience-final.png" width="320" alt="Mira - formatted assistant chat response" />
 </p>
