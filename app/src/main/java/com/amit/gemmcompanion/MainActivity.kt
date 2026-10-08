@@ -77,6 +77,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -814,7 +818,10 @@ private fun MessageBubble(
             modifier = Modifier.fillMaxWidth(0.84f)
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
-                Text(turn.text, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    text = formatChatMarkdown(turn.text),
+                    style = MaterialTheme.typography.bodyMedium
+                )
                 if (isAssistant) {
                     Row(modifier = Modifier.align(Alignment.End)) {
                         IconButton(onClick = { onSaveNote(turn.text) }, modifier = Modifier.size(32.dp)) {
@@ -831,6 +838,139 @@ private fun MessageBubble(
                 }
             }
         }
+    }
+}
+
+internal fun formatChatMarkdown(rawText: String): AnnotatedString {
+    val normalized = rawText.replace("\r\n", "\n").replace("\r", "\n")
+    if (normalized.isBlank()) return AnnotatedString("")
+
+    val builder = AnnotatedString.Builder()
+    val lines = normalized.split('\n')
+    var inCodeBlock = false
+
+    lines.forEachIndexed { index, line ->
+        if (line.trimStart().startsWith("```")) {
+            val textSoFar = builder.toAnnotatedString().text
+            if (index > 0 && textSoFar.isNotEmpty() && textSoFar.last() != '\n') {
+                builder.append('\n')
+            }
+            inCodeBlock = !inCodeBlock
+            return@forEachIndexed
+        }
+
+        val textSoFar = builder.toAnnotatedString().text
+        if (textSoFar.isNotEmpty() && textSoFar.last() != '\n') {
+            builder.append('\n')
+        }
+
+        if (line.isBlank()) {
+            if (inCodeBlock) {
+                builder.append(" ")
+            }
+            return@forEachIndexed
+        }
+
+        if (inCodeBlock) {
+            builder.pushStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0xFFE9EEF3)))
+            builder.append(line)
+            builder.pop()
+            return@forEachIndexed
+        }
+
+        val trimmed = line.trimStart()
+        val text = when {
+            trimmed.startsWith("- ") || trimmed.startsWith("* ") -> "• ${trimmed.removePrefix("- ").removePrefix("* ")}".trimEnd()
+            trimmed.startsWith("#") -> trimmed
+            else -> line.trimEnd()
+        }
+
+        if (text.isBlank()) {
+            return@forEachIndexed
+        }
+
+        appendInlineMarkdown(builder, text)
+    }
+
+    return builder.toAnnotatedString()
+}
+
+private fun appendInlineMarkdown(builder: AnnotatedString.Builder, text: String) {
+    var cursor = 0
+
+    while (cursor < text.length) {
+        val boldMarker = text.indexOf("**", cursor)
+        val italicMarker = text.indexOf("*", cursor)
+        val codeMarker = text.indexOf("`", cursor)
+        val linkMarker = text.indexOf("[", cursor)
+
+        val nextToken = listOf(
+            boldMarker to "bold",
+            italicMarker to "italic",
+            codeMarker to "code",
+            linkMarker to "link"
+        )
+            .filter { it.first >= 0 }
+            .minByOrNull { it.first }
+            ?: break
+
+        val (start, tokenType) = nextToken
+        if (start > cursor) {
+            builder.append(text.substring(cursor, start))
+        }
+
+        when (tokenType) {
+            "bold" -> {
+                val end = text.indexOf("**", start + 2)
+                if (end > start + 2) {
+                    builder.pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+                    appendInlineMarkdown(builder, text.substring(start + 2, end))
+                    builder.pop()
+                    cursor = end + 2
+                    continue
+                }
+            }
+            "italic" -> {
+                val end = text.indexOf("*", start + 1)
+                if (end > start + 1) {
+                    builder.pushStyle(SpanStyle(fontStyle = FontStyle.Italic))
+                    appendInlineMarkdown(builder, text.substring(start + 1, end))
+                    builder.pop()
+                    cursor = end + 1
+                    continue
+                }
+            }
+            "code" -> {
+                val end = text.indexOf("`", start + 1)
+                if (end > start + 1) {
+                    builder.pushStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = Color(0xFFF1F4F7)))
+                    builder.append(text.substring(start + 1, end))
+                    builder.pop()
+                    cursor = end + 1
+                    continue
+                }
+            }
+            "link" -> {
+                val closingBracket = text.indexOf("]", start + 1)
+                val openingParen = text.indexOf("(", closingBracket + 1)
+                val closingParen = text.indexOf(")", openingParen + 1)
+                if (closingBracket > start && openingParen > closingBracket && closingParen > openingParen) {
+                    val label = text.substring(start + 1, closingBracket)
+                    builder.pushStyle(SpanStyle(color = Color(0xFF4F6EEB)))
+                    builder.append(label)
+                    builder.pop()
+                    cursor = closingParen + 1
+                    continue
+                }
+            }
+        }
+
+        builder.append(text.substring(start, start + 1))
+        cursor = start + 1
+    }
+
+    if (cursor < text.length) {
+        builder.append(text.substring(cursor))
     }
 }
 
